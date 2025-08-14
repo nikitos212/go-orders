@@ -6,7 +6,9 @@ import (
 	"log"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nikitos212/go-orders/pkg/model"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -17,61 +19,67 @@ var (
 	dbURL       = "postgresql://orders_user:secret@localhost:5432/orders_db"
 )
 
-type Delivery struct {
-	Name    string `json:"name"`
-	Phone   string `json:"phone"`
-	Zip     string `json:"zip"`
-	City    string `json:"city"`
-	Address string `json:"address"`
-	Region  string `json:"region"`
-	Email   string `json:"email"`
+func GetOrderFromDB(ctx context.Context, db *pgxpool.Pool, id string) (*model.Order, error) {
+	var o model.Order
+
+	var dateCreated time.Time
+	row := db.QueryRow(ctx, `
+SELECT order_uid, track_number, entry, locale, internal_signature, customer_id, delivery_service, shardkey, sm_id, date_created, oof_shard
+FROM orders WHERE order_uid = $1
+`, id)
+
+	err := row.Scan(&o.OrderUID, &o.TrackNumber, &o.Entry, &o.Locale, &o.InternalSignature, &o.CustomerID, &o.DeliveryService, &o.ShardKey, &o.SmID, &dateCreated, &o.OofShard)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, pgx.ErrNoRows
+		}
+		return nil, err
+	}
+	o.DateCreated = dateCreated.UTC().Format(time.RFC3339)
+
+	row = db.QueryRow(ctx, `SELECT name, phone, zip, city, address, region, email FROM delivery WHERE order_uid=$1`, id)
+	var d model.Delivery
+	if err := row.Scan(&d.Name, &d.Phone, &d.Zip, &d.City, &d.Address, &d.Region, &d.Email); err == nil {
+		o.Delivery = d
+	} else {
+		if err != pgx.ErrNoRows {
+			log.Printf("warning: delivery scan for %s: %v", id, err)
+		}
+	}
+
+	row = db.QueryRow(ctx, `SELECT transaction_id, request_id, currency, provider, amount, payment_dt, bank, delivery_cost, goods_total, custom_fee FROM payment WHERE order_uid=$1`, id)
+	var p model.Payment
+	if err := row.Scan(&p.Transaction, &p.RequestID, &p.Currency, &p.Provider, &p.Amount, &p.PaymentDt, &p.Bank, &p.DeliveryCost, &p.GoodsTotal, &p.CustomFee); err == nil {
+		o.Payment = p
+	} else {
+		if err != pgx.ErrNoRows {
+			log.Printf("warning: payment scan for %s: %v", id, err)
+		}
+	}
+
+	rows, err := db.Query(ctx, `SELECT chrt_id, track_number, price, rid, name, sale, size, total_price, nm_id, brand, status FROM items WHERE order_uid=$1 ORDER BY id`, id)
+	if err != nil {
+		return &o, err
+	}
+	defer rows.Close()
+
+	items := make([]model.Item, 0)
+	for rows.Next() {
+		var it model.Item
+		if err := rows.Scan(&it.ChrtID, &it.TrackNumber, &it.Price, &it.Rid, &it.Name, &it.Sale, &it.Size, &it.TotalPrice, &it.NmID, &it.Brand, &it.Status); err != nil {
+			log.Printf("warning: items scan for %s: %v", id, err)
+			continue
+		}
+		items = append(items, it)
+	}
+	if len(items) > 0 {
+		o.Items = items
+	}
+
+	return &o, nil
 }
 
-type Payment struct {
-	Transaction  string `json:"transaction"`
-	RequestID    string `json:"request_id"`
-	Currency     string `json:"currency"`
-	Provider     string `json:"provider"`
-	Amount       int64  `json:"amount"`
-	PaymentDt    int64  `json:"payment_dt"`
-	Bank         string `json:"bank"`
-	DeliveryCost int64  `json:"delivery_cost"`
-	GoodsTotal   int64  `json:"goods_total"`
-	CustomFee    int64  `json:"custom_fee"`
-}
-
-type Item struct {
-	ChrtID      int64  `json:"chrt_id"`
-	TrackNumber string `json:"track_number"`
-	Price       int64  `json:"price"`
-	Rid         string `json:"rid"`
-	Name        string `json:"name"`
-	Sale        int    `json:"sale"`
-	Size        string `json:"size"`
-	TotalPrice  int64  `json:"total_price"`
-	NmID        int64  `json:"nm_id"`
-	Brand       string `json:"brand"`
-	Status      int    `json:"status"`
-}
-
-type Order struct {
-	OrderUID          string   `json:"order_uid"`
-	TrackNumber       string   `json:"track_number"`
-	Entry             string   `json:"entry"`
-	Delivery          Delivery `json:"delivery"`
-	Payment           Payment  `json:"payment"`
-	Items             []Item   `json:"items"`
-	Locale            string   `json:"locale"`
-	InternalSignature string   `json:"internal_signature"`
-	CustomerID        string   `json:"customer_id"`
-	DeliveryService   string   `json:"delivery_service"`
-	ShardKey          string   `json:"shardkey"`
-	SmID              int      `json:"sm_id"`
-	DateCreated       string   `json:"date_created"`
-	OofShard          string   `json:"oof_shard"`
-}
-
-func SaveOrderToDB(ctx context.Context, db *pgxpool.Pool, o *Order) error {
+func SaveOrderToDB(ctx context.Context, db *pgxpool.Pool, o *model.Order) error {
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return err
@@ -157,6 +165,61 @@ func main() {
 	})
 	defer r.Close()
 
+	lookupReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:  []string{kafkaBroker},
+		Topic:    "order-lookup",
+		GroupID:  "order-lookup-group",
+		MinBytes: 1,
+		MaxBytes: 10e6,
+	})
+	defer lookupReader.Close()
+
+	foundWriter := kafka.NewWriter(kafka.WriterConfig{
+		Brokers:  []string{kafkaBroker},
+		Topic:    "order-found",
+		Balancer: &kafka.Hash{},
+	})
+	defer foundWriter.Close()
+
+	go func() {
+		for {
+			msg, err := lookupReader.FetchMessage(ctx)
+			if err != nil {
+				log.Printf("lookup fetch error: %v", err)
+				time.Sleep(time.Second)
+				continue
+			}
+
+			orderUID := string(msg.Value)
+			ord, err := GetOrderFromDB(ctx, db, orderUID)
+			if err != nil {
+				if err == pgx.ErrNoRows {
+					log.Printf("lookup: not found %s", orderUID)
+				} else {
+					log.Printf("lookup DB error for %s: %v", orderUID, err)
+				}
+				_ = lookupReader.CommitMessages(ctx, msg)
+				continue
+			}
+
+			b, _ := json.Marshal(ord)
+			respMsg := kafka.Message{
+				Key:   []byte(ord.OrderUID),
+				Value: b,
+				Time:  time.Now(),
+			}
+			if err := foundWriter.WriteMessages(ctx, respMsg); err != nil {
+				log.Printf("failed to write found msg for %s: %v", ord.OrderUID, err)
+			} else {
+				log.Printf("published order-found for %s", ord.OrderUID)
+			}
+
+			if err := lookupReader.CommitMessages(ctx, msg); err != nil {
+				log.Printf("commit lookup failed: %v", err)
+			}
+		}
+	}()
+
 	log.Println("consumer started")
 	for {
 		msg, err := r.FetchMessage(ctx)
@@ -166,7 +229,7 @@ func main() {
 			continue
 		}
 
-		var ord Order
+		var ord model.Order
 		if err := json.Unmarshal(msg.Value, &ord); err != nil {
 			log.Printf("invalid message offset=%d: %v", msg.Offset, err)
 			if err2 := r.CommitMessages(ctx, msg); err2 != nil {
