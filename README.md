@@ -54,9 +54,7 @@ psql "postgresql://orders_user:secret@localhost:5432/orders_db" -f migrations/00
 **B. В контейнере Postgres**
 
 ```bash
-# узнай имя контейнера
 docker ps
-# скопируем файл и выполним внутри контейнера
 docker cp migrations/001_init.sql <postgres-container>:/tmp/001_init.sql
 docker exec -it <postgres-container> psql -U orders_user -d orders_db -f /tmp/001_init.sql
 ```
@@ -110,13 +108,9 @@ go get github.com/jackc/pgx/v5
 go mod tidy
 ```
 
-Если вы уже выполнили `go mod init`, этот шаг можно пропустить.
-
 ---
 
 ### 3.2 Структура запуска
-
-Обычно запускают сервисы в отдельных терминалах:
 
 - **Терминал A:** consumer
 
@@ -135,13 +129,7 @@ go run ./cmd/api
 go run api.go
 ```
 
-Если не хотите держать много терминалов — используйте `tmux`/`screen`, либо Makefile и открывайте цели в отдельных вкладках/панелях.
-
 ---
-
-## 4. Тестирование API и flow
-
-Предположим, в репозитории есть файл с примером заказа: `migrations/test_order.json` (или `model.json`). Ниже примеры команд и ожидаемое поведение.
 
 ### 4.1 Отправка нового заказа (frontend → API → Kafka orders → consumer → Postgres + cache)
 
@@ -227,6 +215,4 @@ CACHE UPDATED order_uid=b563... source=order-found
 - Логируйте offset'ы и ошибки в consumer для упрощения отладки.
 
 ---
-
-Если хотите, могу также подготовить `Makefile` с целями для локального запуска `consumer` и `api`, или добавить раздел с типичными командами для отладки (например, просмотр логов, повторная публикация сообщений в топик и т.д.).
 
